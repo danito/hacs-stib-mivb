@@ -1,0 +1,50 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "STIB/MIVB Setup",
+        "description": "Configure your STIB/MIVB public transport integration.",
+        "data": {
+          "language": "Display language"
+        }
+      },
+      "add_stop": {
+        "title": "Add a Stop",
+        "description": "Select a line and then choose the stop(s) you want to monitor.",
+        "data": {
+          "line_id": "Line number",
+          "stop_ids": "Stop(s) to monitor"
+        }
+      },
+      "confirm": {
+        "title": "Confirm configuration",
+        "description": "Your selected stops are listed below. You can add more stops or finish setup."
+      }
+    },
+    "error": {
+      "invalid_line": "Could not find any stops for this line. Please check the line number.",
+      "cannot_connect": "Failed to connect to the STIB/MIVB API. Please try again.",
+      "no_stops_selected": "Please select at least one stop."
+    },
+    "abort": {
+      "already_configured": "STIB/MIVB is already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "STIB/MIVB Options",
+        "data": {
+          "scan_interval": "Update interval (seconds)"
+        }
+      },
+      "add_stop": {
+        "title": "Add a Stop",
+        "data": {
+          "line_id": "Line number",
+          "stop_ids": "Stop(s) to monitor"
+        }
+      }
+    }
+  }
+}
