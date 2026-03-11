@@ -28,6 +28,36 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 
+def _stop_option_key(stop: dict) -> str:
+    """Unique key for a stop+direction entry used in the multi-select widget."""
+    return f"{stop['id']}|{stop.get('direction', '')}"
+
+
+def _stop_option_label(stop: dict) -> str:
+    """Human-readable label: 'JUPITER / JUPITER (2935) – City → FOREST (BERVOETS)'."""
+    name = f"{stop['name_fr']} / {stop['name_nl']} ({stop['id']})"
+    direction = stop.get("direction", "")
+    dest_fr = stop.get("destination_fr", "")
+    if direction and dest_fr:
+        return f"{name} – {direction} → {dest_fr}"
+    if direction:
+        return f"{name} – {direction}"
+    return name
+
+
+def _build_stop_options(stops: list[dict]) -> dict[str, str]:
+    """Return {key: label} dict for cv.multi_select."""
+    return {_stop_option_key(s): _stop_option_label(s) for s in stops}
+
+
+def _find_stop_by_key(stops: list[dict], key: str) -> dict | None:
+    """Return the stop dict matching a stop_option_key, or None."""
+    for s in stops:
+        if _stop_option_key(s) == key:
+            return s
+    return None
+
+
 class StibMivbConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle the STIB/MIVB config flow."""
 
@@ -36,7 +66,6 @@ class StibMivbConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     def __init__(self) -> None:
         """Initialise."""
         self._language: str = LANGUAGE_FRENCH
-        # List of {"line_id": str, "stop_id": str, "stop_name_fr": str, "stop_name_nl": str, ...}
         self._configured_stops: list[dict] = []
         self._available_stops: list[dict] = []
         self._current_line_id: str = ""
@@ -66,10 +95,10 @@ class StibMivbConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     async def async_step_add_stop(
         self, user_input: dict[str, Any] | None = None
     ) -> config_entries.FlowResult:
-        """Step 2 – pick a line then pick stops from that line."""
+        """Step 2a – enter line number; Step 2b – select stops from that line."""
         errors: dict[str, str] = {}
 
-        # Sub-step A: user typed a line number, fetch available stops
+        # ── Sub-step A: user submitted a line number ──────────────────────────
         if user_input is not None and CONF_LINE_ID in user_input and CONF_STOP_IDS not in user_input:
             line_id = str(user_input[CONF_LINE_ID]).strip()
             session = async_get_clientsession(self.hass)
@@ -86,15 +115,15 @@ class StibMivbConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 self._available_stops = stops
                 self._current_line_id = line_id
 
-        # Sub-step B: user selected stops from the fetched list
+        # ── Sub-step B: user selected stops from the list ────────────────────
         if user_input is not None and CONF_STOP_IDS in user_input:
-            selected_ids: list[str] = user_input[CONF_STOP_IDS]
-            if not selected_ids:
+            selected_keys: list[str] = user_input[CONF_STOP_IDS]
+            if not selected_keys:
                 errors[CONF_STOP_IDS] = "no_stops_selected"
             else:
-                # Store each selected stop
-                for stop in self._available_stops:
-                    if stop["id"] in selected_ids:
+                for key in selected_keys:
+                    stop = _find_stop_by_key(self._available_stops, key)
+                    if stop:
                         self._configured_stops.append(
                             {
                                 "line_id": self._current_line_id,
@@ -112,16 +141,14 @@ class StibMivbConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 self._current_line_id = ""
                 return await self.async_step_confirm()
 
-        # Build the form.
-        # If we already have stops loaded for a line, show the stop selector.
+        # ── Render form ───────────────────────────────────────────────────────
         if self._available_stops:
-            stop_options = {
-                s["id"]: f"{s['name_fr']} / {s['name_nl']} ({s['id']})"
-                for s in self._available_stops
-            }
+            # Show the stop multi-select; keys embed direction so they are unique
             schema = vol.Schema(
                 {
-                    vol.Required(CONF_STOP_IDS): cv.multi_select(stop_options),
+                    vol.Required(CONF_STOP_IDS): cv.multi_select(
+                        _build_stop_options(self._available_stops)
+                    ),
                 }
             )
             return self.async_show_form(
@@ -131,12 +158,8 @@ class StibMivbConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 description_placeholders={"line_id": self._current_line_id},
             )
 
-        # Otherwise show the line-number input
-        schema = vol.Schema(
-            {
-                vol.Required(CONF_LINE_ID): str,
-            }
-        )
+        # Show the line-number input
+        schema = vol.Schema({vol.Required(CONF_LINE_ID): str})
         return self.async_show_form(step_id="add_stop", data_schema=schema, errors=errors)
 
     async def async_step_confirm(
@@ -149,11 +172,11 @@ class StibMivbConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             action = user_input.get("action", "finish")
             if action == "add_more":
                 return await self.async_step_add_stop()
-            # Finish
             return self._create_entry()
 
         stops_summary = "\n".join(
-            f"Line {s['line_id']} – {s['stop_name_fr']} / {s['stop_name_nl']} ({s['stop_id']})"
+            f"Line {s['line_id']} – {s['stop_name_fr']} / {s['stop_name_nl']}"
+            f" ({s['stop_id']}) – {s.get('direction', '')}"
             for s in self._configured_stops
         )
 
@@ -207,16 +230,15 @@ class StibMivbOptionsFlow(config_entries.OptionsFlow):
             action = user_input.get("action", "finish")
             if action == "add_stop":
                 return await self.async_step_add_stop()
-            if action == "finish":
-                return self.async_create_entry(
-                    title="",
-                    data={
-                        CONF_STOPS: self._configured_stops,
-                        CONF_SCAN_INTERVAL: user_input.get(
-                            CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL
-                        ),
-                    },
-                )
+            return self.async_create_entry(
+                title="",
+                data={
+                    CONF_STOPS: self._configured_stops,
+                    CONF_SCAN_INTERVAL: user_input.get(
+                        CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL
+                    ),
+                },
+            )
 
         current_interval = self._config_entry.options.get(
             CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL
@@ -256,9 +278,10 @@ class StibMivbOptionsFlow(config_entries.OptionsFlow):
                 self._current_line_id = line_id
 
         if user_input is not None and CONF_STOP_IDS in user_input:
-            selected_ids: list[str] = user_input[CONF_STOP_IDS]
-            for stop in self._available_stops:
-                if stop["id"] in selected_ids:
+            selected_keys: list[str] = user_input[CONF_STOP_IDS]
+            for key in selected_keys:
+                stop = _find_stop_by_key(self._available_stops, key)
+                if stop:
                     self._configured_stops.append(
                         {
                             "line_id": self._current_line_id,
@@ -276,11 +299,13 @@ class StibMivbOptionsFlow(config_entries.OptionsFlow):
             return await self.async_step_init()
 
         if self._available_stops:
-            stop_options = {
-                s["id"]: f"{s['name_fr']} / {s['name_nl']} ({s['id']})"
-                for s in self._available_stops
-            }
-            schema = vol.Schema({vol.Required(CONF_STOP_IDS): cv.multi_select(stop_options)})
+            schema = vol.Schema(
+                {
+                    vol.Required(CONF_STOP_IDS): cv.multi_select(
+                        _build_stop_options(self._available_stops)
+                    )
+                }
+            )
             return self.async_show_form(step_id="add_stop", data_schema=schema, errors=errors)
 
         schema = vol.Schema({vol.Required(CONF_LINE_ID): str})

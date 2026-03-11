@@ -46,14 +46,20 @@ class StibMivbApiClient:
 
     async def get_stops_for_line(self, line_id: str) -> list[dict]:
         """
-        Return a flat list of unique stop dicts for a given line.
-        Each dict: { id, name_fr, name_nl, direction, destination_fr, destination_nl }
+        Return a list of stop dicts for a given line, one entry per stop+direction
+        combination.  The same physical stop will appear twice if it is served in
+        both City and Suburb directions.
+
+        Each dict: { id, name_fr, name_nl, latitude, longitude,
+                     direction, destination_fr, destination_nl }
         """
         data = await self._get(API_STOPS_BY_LINE, params={"where": f"lineid={line_id}"})
         results = data.get("results", [])
 
-        seen_ids: set[str] = set()
-        stops: list[dict] = []
+        # Collect (stop_id, direction, dest_fr, dest_nl) – one tuple per occurrence.
+        # Do NOT deduplicate here: the same stop_id in two directions needs two entries.
+        raw_stops: list[tuple[str, str, str, str]] = []
+        all_stop_ids: set[str] = set()
 
         for direction_row in results:
             direction = direction_row.get("direction", "")
@@ -67,29 +73,77 @@ class StibMivbApiClient:
 
             for point in points:
                 stop_id = str(point.get("id", ""))
-                if not stop_id or stop_id in seen_ids:
+                if not stop_id:
                     continue
-                seen_ids.add(stop_id)
+                raw_stops.append((stop_id, direction, dest_fr, dest_nl))
+                all_stop_ids.add(stop_id)
 
-                # Fetch stop name/coordinates
-                details = await self.get_stop_details(stop_id)
-                stops.append(
-                    {
-                        "id": stop_id,
-                        "name_fr": details.get("name_fr", stop_id),
-                        "name_nl": details.get("name_nl", stop_id),
-                        "latitude": details.get("latitude"),
-                        "longitude": details.get("longitude"),
-                        "direction": direction,
-                        "destination_fr": dest_fr,
-                        "destination_nl": dest_nl,
-                    }
-                )
+        if not all_stop_ids:
+            return []
+
+        # Batch-fetch names + coordinates for all unique stop IDs in one API call.
+        details_map = await self._get_stop_details_batch(all_stop_ids)
+
+        stops: list[dict] = []
+        for stop_id, direction, dest_fr, dest_nl in raw_stops:
+            details = details_map.get(stop_id, {})
+            stops.append(
+                {
+                    "id": stop_id,
+                    "name_fr": details.get("name_fr", stop_id),
+                    "name_nl": details.get("name_nl", stop_id),
+                    "latitude": details.get("latitude"),
+                    "longitude": details.get("longitude"),
+                    "direction": direction,
+                    "destination_fr": dest_fr,
+                    "destination_nl": dest_nl,
+                }
+            )
 
         return stops
 
+    async def _get_stop_details_batch(self, stop_ids: set[str]) -> dict[str, dict]:
+        """
+        Fetch name + coordinates for multiple stops in a single API call.
+        Returns a dict keyed by stop_id.
+        """
+        # ODS WHERE syntax: id in ("2935","2936",...)
+        id_list = ",".join(f'"{sid}"' for sid in stop_ids)
+        try:
+            data = await self._get(
+                API_STOP_DETAILS,
+                params={
+                    "where": f"id in ({id_list})",
+                    "limit": len(stop_ids) + 10,
+                },
+            )
+            results = data.get("results", [])
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning("Batch stop details fetch failed, falling back to empty: %s", err)
+            return {}
+
+        details_map: dict[str, dict] = {}
+        for row in results:
+            sid = str(row.get("id", ""))
+            if not sid:
+                continue
+            name = _maybe_parse_json(row.get("name", {}))
+            coords = _maybe_parse_json(row.get("gpscoordinates", {}))
+            name_fr = name.get("fr", sid) if isinstance(name, dict) else str(name)
+            name_nl = name.get("nl", name_fr) if isinstance(name, dict) else str(name)
+            lat = coords.get("latitude") if isinstance(coords, dict) else None
+            lon = coords.get("longitude") if isinstance(coords, dict) else None
+            details_map[sid] = {
+                "name_fr": name_fr,
+                "name_nl": name_nl,
+                "latitude": lat,
+                "longitude": lon,
+            }
+
+        return details_map
+
     async def get_stop_details(self, stop_id: str) -> dict:
-        """Return name (fr/nl) and GPS coordinates for a stop."""
+        """Return name (fr/nl) and GPS coordinates for a single stop."""
         try:
             data = await self._get(API_STOP_DETAILS, params={"where": f"id={stop_id}"})
             results = data.get("results", [])
@@ -122,7 +176,7 @@ class StibMivbApiClient:
         Returns:
           {
             "minutes": int | None,
-            "next_passage": str | None,  # ISO timestamp
+            "next_passage": str | None,  # ISO timestamp of second upcoming vehicle
             "destination_fr": str,
             "destination_nl": str,
           }
@@ -181,7 +235,6 @@ class StibMivbApiClient:
         if not iso_timestamp:
             return None
         try:
-            # Parse with timezone offset
             arrival = datetime.fromisoformat(iso_timestamp)
             now = datetime.now(tz=arrival.tzinfo)
             delta = (arrival - now).total_seconds()
