@@ -1,8 +1,6 @@
 # STIB/MIVB — Home Assistant HACS Integration
 
 [![hacs_badge](https://img.shields.io/badge/HACS-Custom-orange.svg)](https://github.com/hacs/integration)
-[![GitHub Release][releasebadge]][release]
-[![License][licensebadge]](LICENSE)
 
 Monitor real-time bus/tram/metro waiting times from the **Brussels public transport network (STIB/MIVB)** directly in Home Assistant.
 
