@@ -35,6 +35,14 @@ def _stop_option_key(stop: dict) -> str:
 
 def _stop_option_label(stop: dict) -> str:
     """Human-readable label: 'JUPITER / JUPITER (2935) – City → FOREST (BERVOETS)'."""
+    _LOGGER.debug(
+        "Building stop label – id=%s name_fr=%r name_nl=%r direction=%r destination_fr=%r",
+        stop.get("id"),
+        stop.get("name_fr"),
+        stop.get("name_nl"),
+        stop.get("direction"),
+        stop.get("destination_fr"),
+    )
     name = f"{stop['name_fr']} / {stop['name_nl']} ({stop['id']})"
     direction = stop.get("direction", "")
     dest_fr = stop.get("destination_fr", "")
