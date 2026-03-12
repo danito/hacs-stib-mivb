@@ -106,35 +106,38 @@ class StibMivbApiClient:
 
     async def _get_stop_details_batch(self, stop_ids: set[str]) -> dict[str, dict]:
         """
-        Fetch name + coordinates for multiple stops in a single API call.
+        Fetch name + coordinates for all stops.
+
+        Strategy: build a WHERE clause with OR-chained id= conditions, which is
+        standard ODS syntax.  If the API returns fewer results than expected we
+        fall back to concurrent individual calls via asyncio.gather.
         Returns a dict keyed by stop_id.
         """
-        id_list = ",".join(f'"{sid}"' for sid in stop_ids)
-        where_clause = f"id in ({id_list})"
+        import asyncio
+
+        # Build: id=2935 OR id=2936 OR ...
+        where_clause = " OR ".join(f"id={sid}" for sid in stop_ids)
         limit = len(stop_ids) + 10
         _LOGGER.debug(
-            "Batch fetch – where=%r limit=%d", where_clause, limit
+            "Batch fetch (OR) – %d stops, limit=%d", len(stop_ids), limit
         )
+
         try:
             data = await self._get(
                 API_STOP_DETAILS,
                 params={"where": where_clause, "limit": limit},
             )
-            total = data.get("total_count")
             results = data.get("results", [])
             _LOGGER.debug(
-                "Batch fetch – total_count=%s results_returned=%d",
-                total,
+                "Batch fetch (OR) – got %d results (expected %d)",
                 len(results),
+                len(stop_ids),
             )
-            if results:
-                _LOGGER.debug("Batch fetch – first raw result: %s", results[0])
         except Exception as err:  # noqa: BLE001
-            _LOGGER.warning(
-                "Batch stop details fetch failed, falling back to empty: %s", err
-            )
-            return {}
+            _LOGGER.warning("Batch OR fetch failed: %s – falling back to concurrent calls", err)
+            results = []
 
+        # Build the map from whatever the OR query returned
         details_map: dict[str, dict] = {}
         for row in results:
             sid = str(row.get("id", ""))
@@ -153,10 +156,34 @@ class StibMivbApiClient:
                 "longitude": lon,
             }
 
+        # If the OR query was ignored (returned unrelated stops), fall back to
+        # concurrent individual calls — all fire in parallel so still fast.
+        missing = stop_ids - details_map.keys()
+        if missing:
+            _LOGGER.debug(
+                "OR fetch missed %d stops, fetching individually: %s",
+                len(missing),
+                missing,
+            )
+
+            async def _fetch_one(sid: str) -> tuple[str, dict]:
+                details = await self.get_stop_details(sid)
+                return sid, details
+
+            individual = await asyncio.gather(
+                *(_fetch_one(sid) for sid in missing),
+                return_exceptions=True,
+            )
+            for item in individual:
+                if isinstance(item, Exception):
+                    _LOGGER.warning("Individual stop fetch failed: %s", item)
+                    continue
+                sid, details = item
+                if details:
+                    details_map[sid] = details
+
         _LOGGER.debug(
-            "Batch fetch – resolved %d/%d stop names",
-            len(details_map),
-            len(stop_ids),
+            "Resolved %d/%d stop names", len(details_map), len(stop_ids)
         )
         return details_map
 
