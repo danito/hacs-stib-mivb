@@ -35,6 +35,7 @@ class StibMivbApiClient:
         """Initialise the client."""
         self._session = session
         self._headers = {API_KEY_HEADER: api_key}
+        self._stop_cache: dict[str, dict] = {}
 
     async def _get(self, url: str, params: dict | None = None) -> dict:
         """Make a GET request and return the JSON response."""
@@ -109,60 +110,76 @@ class StibMivbApiClient:
 
         return stops
 
+    async def _get_all_stops(self) -> dict[str, dict]:
+        """
+        Fetch the complete stop catalogue (~2445 stops) in paginated chunks
+        and return a dict keyed by stop_id.
+
+        The StopDetails endpoint ignores all WHERE filters, so we download
+        the full dataset once and filter client-side.  The result is cached
+        on the instance so subsequent calls within the same session are free.
+        """
+        if self._stop_cache:
+            return self._stop_cache
+
+        _LOGGER.debug("Fetching full stop catalogue (paginated)…")
+        PAGE = 100
+        offset = 0
+        catalogue: dict[str, dict] = {}
+
+        while True:
+            try:
+                data = await self._get(
+                    API_STOP_DETAILS,
+                    params={"limit": PAGE, "offset": offset},
+                )
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.warning("Stop catalogue fetch failed at offset %d: %s", offset, err)
+                break
+
+            results = data.get("results", [])
+            total = data.get("total_count", 0)
+
+            for row in results:
+                sid = str(row.get("id", ""))
+                if not sid:
+                    continue
+                name = _maybe_parse_json(row.get("name", {}))
+                coords = _maybe_parse_json(row.get("gpscoordinates", {}))
+                name_fr = name.get("fr", sid) if isinstance(name, dict) else str(name)
+                name_nl = name.get("nl", name_fr) if isinstance(name, dict) else str(name)
+                lat = coords.get("latitude") if isinstance(coords, dict) else None
+                lon = coords.get("longitude") if isinstance(coords, dict) else None
+                catalogue[sid] = {
+                    "name_fr": name_fr,
+                    "name_nl": name_nl,
+                    "latitude": lat,
+                    "longitude": lon,
+                }
+
+            offset += len(results)
+            _LOGGER.debug(
+                "Stop catalogue: fetched %d/%d so far", offset, total
+            )
+
+            if not results or offset >= total:
+                break
+
+        _LOGGER.debug("Stop catalogue complete – %d stops loaded", len(catalogue))
+        self._stop_cache = catalogue
+        return catalogue
+
     async def _get_stop_details_batch(self, stop_ids: set[str]) -> dict[str, dict]:
         """
-        Fetch name + coordinates for multiple stops in a single API call.
-
-        Uses the bracket filter syntax supported by this API:
-          where=[id=2935, id=2936, id=2934A]
-
-        Returns a dict keyed by stop_id.
+        Return name + coordinates for the requested stop IDs.
+        Pulls from the full catalogue cache (fetched once per session).
         """
-        where_clause = "[" + ", ".join(f"id={sid}" for sid in stop_ids) + "]"
-        limit = len(stop_ids) + 10
-        _LOGGER.debug(
-            "Batch fetch – %d stops, limit=%d", len(stop_ids), limit
-        )
-
-        try:
-            data = await self._get(
-                API_STOP_DETAILS,
-                params={"where": where_clause, "limit": limit},
-            )
-            results = data.get("results", [])
-            _LOGGER.debug(
-                "Batch fetch – got %d results (expected %d)",
-                len(results),
-                len(stop_ids),
-            )
-        except Exception as err:  # noqa: BLE001
-            _LOGGER.warning("Batch fetch failed: %s", err)
-            return {}
-
-        details_map: dict[str, dict] = {}
-        for row in results:
-            sid = str(row.get("id", ""))
-            if not sid:
-                continue
-            name = _maybe_parse_json(row.get("name", {}))
-            coords = _maybe_parse_json(row.get("gpscoordinates", {}))
-            name_fr = name.get("fr", sid) if isinstance(name, dict) else str(name)
-            name_nl = name.get("nl", name_fr) if isinstance(name, dict) else str(name)
-            lat = coords.get("latitude") if isinstance(coords, dict) else None
-            lon = coords.get("longitude") if isinstance(coords, dict) else None
-            details_map[sid] = {
-                "name_fr": name_fr,
-                "name_nl": name_nl,
-                "latitude": lat,
-                "longitude": lon,
-            }
-
-        _LOGGER.debug(
-            "Batch fetch – resolved %d/%d stop names",
-            len(details_map),
-            len(stop_ids),
-        )
-        return details_map
+        catalogue = await self._get_all_stops()
+        result = {sid: catalogue[sid] for sid in stop_ids if sid in catalogue}
+        missing = stop_ids - result.keys()
+        if missing:
+            _LOGGER.debug("Stop IDs not found in catalogue: %s", missing)
+        return result
 
     async def get_stop_details(self, stop_id: str) -> dict:
         """Return name (fr/nl) and GPS coordinates for a single stop."""
