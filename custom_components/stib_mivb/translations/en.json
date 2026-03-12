@@ -3,9 +3,10 @@
     "step": {
       "user": {
         "title": "STIB/MIVB Setup",
-        "description": "Configure your STIB/MIVB public transport integration.",
+        "description": "Enter your STIB/MIVB API key and preferred display language. You can request a free key at opendata.stib-mivb.be.",
         "data": {
-          "language": "Display language"
+          "language": "Display language",
+          "api_key": "API key (bmc-partner-key)"
         }
       },
       "add_stop": {
@@ -24,7 +25,8 @@
     "error": {
       "invalid_line": "Could not find any stops for this line. Please check the line number.",
       "cannot_connect": "Failed to connect to the STIB/MIVB API. Please try again.",
-      "no_stops_selected": "Please select at least one stop."
+      "no_stops_selected": "Please select at least one stop.",
+      "invalid_api_key": "Invalid API key — the test request returned no data. Please check your key."
     },
     "abort": {
       "already_configured": "STIB/MIVB is already configured."

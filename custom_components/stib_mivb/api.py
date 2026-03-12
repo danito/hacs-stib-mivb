@@ -9,6 +9,7 @@ from typing import Any
 import aiohttp
 
 from .const import (
+    API_KEY_HEADER,
     API_STOP_DETAILS,
     API_STOPS_BY_LINE,
     API_WAITING_TIMES,
@@ -30,15 +31,19 @@ def _maybe_parse_json(value: Any) -> Any:
 class StibMivbApiClient:
     """API client for STIB/MIVB open data."""
 
-    def __init__(self, session: aiohttp.ClientSession) -> None:
+    def __init__(self, session: aiohttp.ClientSession, api_key: str) -> None:
         """Initialise the client."""
         self._session = session
+        self._headers = {API_KEY_HEADER: api_key}
 
     async def _get(self, url: str, params: dict | None = None) -> dict:
         """Make a GET request and return the JSON response."""
         try:
             async with self._session.get(
-                url, params=params, timeout=aiohttp.ClientTimeout(total=10)
+                url,
+                params=params,
+                headers=self._headers,
+                timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
                 resp.raise_for_status()
                 return await resp.json(content_type=None)
@@ -58,8 +63,8 @@ class StibMivbApiClient:
         data = await self._get(API_STOPS_BY_LINE, params={"where": f"lineid={line_id}"})
         results = data.get("results", [])
 
-        # Collect (stop_id, direction, dest_fr, dest_nl) – one per occurrence.
-        # Do NOT deduplicate: same stop_id in two directions = two sensors.
+        # Collect (stop_id, direction, dest_fr, dest_nl) per occurrence.
+        # Do NOT deduplicate: same stop in two directions = two sensors.
         raw_stops: list[tuple[str, str, str, str]] = []
         all_stop_ids: set[str] = set()
 
@@ -106,20 +111,17 @@ class StibMivbApiClient:
 
     async def _get_stop_details_batch(self, stop_ids: set[str]) -> dict[str, dict]:
         """
-        Fetch name + coordinates for all stops.
+        Fetch name + coordinates for multiple stops in a single API call.
 
-        Strategy: build a WHERE clause with OR-chained id= conditions, which is
-        standard ODS syntax.  If the API returns fewer results than expected we
-        fall back to concurrent individual calls via asyncio.gather.
+        Uses the bracket filter syntax supported by this API:
+          where=[id=2935, id=2936, id=2934A]
+
         Returns a dict keyed by stop_id.
         """
-        import asyncio
-
-        # Build: id=2935 OR id=2936 OR ...
-        where_clause = " OR ".join(f"id={sid}" for sid in stop_ids)
+        where_clause = "[" + ", ".join(f"id={sid}" for sid in stop_ids) + "]"
         limit = len(stop_ids) + 10
         _LOGGER.debug(
-            "Batch fetch (OR) – %d stops, limit=%d", len(stop_ids), limit
+            "Batch fetch – %d stops, limit=%d", len(stop_ids), limit
         )
 
         try:
@@ -129,15 +131,14 @@ class StibMivbApiClient:
             )
             results = data.get("results", [])
             _LOGGER.debug(
-                "Batch fetch (OR) – got %d results (expected %d)",
+                "Batch fetch – got %d results (expected %d)",
                 len(results),
                 len(stop_ids),
             )
         except Exception as err:  # noqa: BLE001
-            _LOGGER.warning("Batch OR fetch failed: %s – falling back to concurrent calls", err)
-            results = []
+            _LOGGER.warning("Batch fetch failed: %s", err)
+            return {}
 
-        # Build the map from whatever the OR query returned
         details_map: dict[str, dict] = {}
         for row in results:
             sid = str(row.get("id", ""))
@@ -156,34 +157,10 @@ class StibMivbApiClient:
                 "longitude": lon,
             }
 
-        # If the OR query was ignored (returned unrelated stops), fall back to
-        # concurrent individual calls — all fire in parallel so still fast.
-        missing = stop_ids - details_map.keys()
-        if missing:
-            _LOGGER.debug(
-                "OR fetch missed %d stops, fetching individually: %s",
-                len(missing),
-                missing,
-            )
-
-            async def _fetch_one(sid: str) -> tuple[str, dict]:
-                details = await self.get_stop_details(sid)
-                return sid, details
-
-            individual = await asyncio.gather(
-                *(_fetch_one(sid) for sid in missing),
-                return_exceptions=True,
-            )
-            for item in individual:
-                if isinstance(item, Exception):
-                    _LOGGER.warning("Individual stop fetch failed: %s", item)
-                    continue
-                sid, details = item
-                if details:
-                    details_map[sid] = details
-
         _LOGGER.debug(
-            "Resolved %d/%d stop names", len(details_map), len(stop_ids)
+            "Batch fetch – resolved %d/%d stop names",
+            len(details_map),
+            len(stop_ids),
         )
         return details_map
 

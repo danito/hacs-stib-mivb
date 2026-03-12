@@ -14,6 +14,7 @@ import homeassistant.helpers.config_validation as cv
 
 from .api import StibMivbApiClient
 from .const import (
+    CONF_API_KEY,
     CONF_LANGUAGE,
     CONF_LINE_ID,
     CONF_SCAN_INTERVAL,
@@ -74,6 +75,7 @@ class StibMivbConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     def __init__(self) -> None:
         """Initialise."""
         self._language: str = LANGUAGE_FRENCH
+        self._api_key: str = ""
         self._configured_stops: list[dict] = []
         self._available_stops: list[dict] = []
         self._current_line_id: str = ""
@@ -89,13 +91,25 @@ class StibMivbConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         if user_input is not None:
             self._language = user_input[CONF_LANGUAGE]
-            return await self.async_step_add_stop()
+            self._api_key = user_input[CONF_API_KEY].strip()
+            # Validate the key by fetching a known stop
+            session = async_get_clientsession(self.hass)
+            client = StibMivbApiClient(session, self._api_key)
+            try:
+                details = await client.get_stop_details("2935")
+                if not details:
+                    errors[CONF_API_KEY] = "invalid_api_key"
+                else:
+                    return await self.async_step_add_stop()
+            except aiohttp.ClientError:
+                errors["base"] = "cannot_connect"
 
         schema = vol.Schema(
             {
                 vol.Required(CONF_LANGUAGE, default=LANGUAGE_FRENCH): vol.In(
                     {LANGUAGE_FRENCH: "Français", LANGUAGE_DUTCH: "Nederlands"}
-                )
+                ),
+                vol.Required(CONF_API_KEY): str,
             }
         )
         return self.async_show_form(step_id="user", data_schema=schema, errors=errors)
@@ -110,7 +124,7 @@ class StibMivbConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if user_input is not None and CONF_LINE_ID in user_input and CONF_STOP_IDS not in user_input:
             line_id = str(user_input[CONF_LINE_ID]).strip()
             session = async_get_clientsession(self.hass)
-            client = StibMivbApiClient(session)
+            client = StibMivbApiClient(session, self._api_key)
             try:
                 stops = await client.get_stops_for_line(line_id)
             except aiohttp.ClientError:
@@ -206,6 +220,7 @@ class StibMivbConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return self.async_create_entry(
             title="STIB/MIVB",
             data={
+                CONF_API_KEY: self._api_key,
                 CONF_LANGUAGE: self._language,
                 CONF_STOPS: self._configured_stops,
             },
@@ -272,7 +287,8 @@ class StibMivbOptionsFlow(config_entries.OptionsFlow):
         if user_input is not None and CONF_LINE_ID in user_input and CONF_STOP_IDS not in user_input:
             line_id = str(user_input[CONF_LINE_ID]).strip()
             session = async_get_clientsession(self.hass)
-            client = StibMivbApiClient(session)
+            api_key = self._config_entry.data.get(CONF_API_KEY, "")
+            client = StibMivbApiClient(session, api_key)
             try:
                 stops = await client.get_stops_for_line(line_id)
             except aiohttp.ClientError:

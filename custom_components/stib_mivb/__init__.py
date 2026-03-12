@@ -14,6 +14,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 
 from .api import StibMivbApiClient
 from .const import (
+    CONF_API_KEY,
     CONF_SCAN_INTERVAL,
     CONF_STOPS,
     DEFAULT_SCAN_INTERVAL,
@@ -28,7 +29,8 @@ PLATFORMS = ["sensor"]
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up STIB/MIVB from a config entry."""
     session = async_get_clientsession(hass)
-    client = StibMivbApiClient(session)
+    api_key = entry.data.get(CONF_API_KEY, "")
+    client = StibMivbApiClient(session, api_key)
 
     # Verify we can reach the API
     try:
