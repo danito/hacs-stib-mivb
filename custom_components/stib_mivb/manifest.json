@@ -1,7 +1,7 @@
 {
   "domain": "stib_mivb",
   "name": "STIB/MIVB",
-  "version": "2.2.1",
+  "version": "2.2.2",
   "documentation": "https://github.com/danito/hacs-stib-mivb",
   "issue_tracker": "https://github.com/danito/hacs-stib-mivb/issues",
   "codeowners": [
