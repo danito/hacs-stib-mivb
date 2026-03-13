@@ -16,7 +16,7 @@ from .api import StibMivbApiClient
 from .const import (
     CONF_API_KEY,
     CONF_SCAN_INTERVAL,
-    CONF_STOPS,
+    CONF_STOP_GROUPS,
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
 )
@@ -32,11 +32,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     api_key = entry.data.get(CONF_API_KEY, "")
     client = StibMivbApiClient(session, api_key)
 
-    # Verify we can reach the API
+    # Verify connectivity
     try:
-        stops = entry.data.get(CONF_STOPS, [])
-        if stops:
-            await client.get_stop_details(stops[0]["stop_id"])
+        details = await client.get_stop_details("2935")
+        if not details:
+            raise ConfigEntryNotReady("API key validation returned no data")
     except aiohttp.ClientError as err:
         raise ConfigEntryNotReady(f"Cannot connect to STIB/MIVB API: {err}") from err
 
@@ -67,7 +67,7 @@ async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> Non
 
 
 class StibMivbCoordinator(DataUpdateCoordinator):
-    """Coordinator that fetches waiting times for all configured stops."""
+    """Coordinator that fetches waiting times for all configured stop groups."""
 
     def __init__(
         self,
@@ -88,38 +88,35 @@ class StibMivbCoordinator(DataUpdateCoordinator):
 
     async def _async_update_data(self) -> dict:
         """
-        Fetch waiting times for every configured stop/line/direction combination.
+        Fetch waiting times for every configured stop group.
 
         Returns:
           {
-            (line_id, stop_id, direction): {
-              "minutes": int | None,
-              "next_passage": str | None,
-              "destination_fr": str,
-              "destination_nl": str,
-            },
+            stop_group_name_fr: [
+              {
+                "line_id": str,
+                "destination_fr": str,
+                "destination_nl": str,
+                "minutes": int | None,
+                "next_passage": str | None,
+                "point_id": str,
+              },
+              ...
+            ],
             ...
           }
         """
-        stops = self.entry.data.get(CONF_STOPS, [])
+        groups = self.entry.data.get(CONF_STOP_GROUPS, [])
         data: dict = {}
 
-        for stop in stops:
-            line_id = stop["line_id"]
-            stop_id = stop["stop_id"]
-            direction = stop.get("direction", "")
+        for group in groups:
+            name_fr = group["name_fr"]
+            point_ids = group.get("point_ids", [])
             try:
-                result = await self.client.get_waiting_times(stop_id, line_id)
-                data[(line_id, stop_id, direction)] = result
+                passages = await self.client.get_waiting_times_for_group(point_ids)
+                data[name_fr] = passages
             except Exception as err:  # noqa: BLE001
-                _LOGGER.warning(
-                    "Failed to update stop %s line %s: %s", stop_id, line_id, err
-                )
-                data[(line_id, stop_id, direction)] = {
-                    "minutes": None,
-                    "next_passage": None,
-                    "destination_fr": "",
-                    "destination_nl": "",
-                }
+                _LOGGER.warning("Failed to update stop group %s: %s", name_fr, err)
+                data[name_fr] = []
 
         return data

@@ -5,17 +5,13 @@ DEFAULT_SCAN_INTERVAL = 30  # seconds
 
 CONF_LANGUAGE = "language"
 CONF_API_KEY = "api_key"
-CONF_LINE_ID = "line_id"
-CONF_STOP_IDS = "stop_ids"
-CONF_STOPS = "stops"
+CONF_STOP_SEARCH = "stop_search"
+CONF_STOP_NAME = "stop_name"
+CONF_STOP_GROUPS = "stop_groups"  # list of grouped stop entries
 CONF_SCAN_INTERVAL = "scan_interval"
 
 LANGUAGE_FRENCH = "fr"
 LANGUAGE_DUTCH = "nl"
-LANGUAGE_OPTIONS = {
-    "French": LANGUAGE_FRENCH,
-    "Nederlands": LANGUAGE_DUTCH,
-}
 
 # Authenticated endpoint (requires bmc-partner-key header)
 API_BASE = "https://api-management-opendata-production.azure-api.net/api/datasets/stibmivb"
@@ -33,4 +29,4 @@ ATTR_STOP_NAME_NL = "stop_name_nl"
 ATTR_DIRECTION = "direction"
 ATTR_DESTINATION = "destination"
 ATTR_LINE_ID = "line_id"
-ATTR_STOP_ID = "stop_id"
+ATTR_POINT_IDS = "point_ids"

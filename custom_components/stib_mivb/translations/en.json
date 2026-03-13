@@ -3,30 +3,39 @@
     "step": {
       "user": {
         "title": "STIB/MIVB Setup",
-        "description": "Enter your STIB/MIVB API key and preferred display language. You can request a free key at opendata.stib-mivb.be.",
+        "description": "Enter your STIB/MIVB API key and preferred display language. Request a free key at opendata.stib-mivb.be.",
         "data": {
           "language": "Display language",
           "api_key": "API key (bmc-partner-key)"
         }
       },
-      "add_stop": {
-        "title": "Add a Stop",
-        "description": "Enter a line number to search for stops. You can add multiple stops.",
+      "search": {
+        "title": "Search for a Stop",
+        "description": "Type part of a stop name to search (min. 2 characters). Already added: {already_added}",
         "data": {
-          "line_id": "Line number",
-          "stop_ids": "Stop(s) to monitor"
+          "stop_search": "Stop name search"
+        }
+      },
+      "pick_stop": {
+        "title": "Select a Stop",
+        "description": "Choose the stop you want to monitor.",
+        "data": {
+          "stop_name": "Stop name"
         }
       },
       "confirm": {
-        "title": "Confirm configuration",
-        "description": "Setup complete. You can manage stops later via the integration options."
+        "title": "Confirm Configuration",
+        "description": "Stops to monitor:\n{stops_summary}\n\nAdd more stops or finish setup.",
+        "data": {
+          "action": "Next action"
+        }
       }
     },
     "error": {
-      "invalid_line": "Could not find any stops for this line. Please check the line number.",
-      "cannot_connect": "Failed to connect to the STIB/MIVB API. Please try again.",
-      "no_stops_selected": "Please select at least one stop.",
-      "invalid_api_key": "Invalid API key — the test request returned no data. Please check your key."
+      "cannot_connect": "Failed to connect to the STIB/MIVB API.",
+      "invalid_api_key": "Invalid API key — the test request returned no data.",
+      "search_too_short": "Please enter at least 2 characters.",
+      "no_results": "No stops found matching your search."
     },
     "abort": {
       "already_configured": "STIB/MIVB is already configured."
@@ -37,14 +46,20 @@
       "init": {
         "title": "STIB/MIVB Options",
         "data": {
-          "scan_interval": "Update interval (seconds)"
+          "scan_interval": "Update interval (seconds)",
+          "action": "Next action"
         }
       },
-      "add_stop": {
-        "title": "Add a Stop",
+      "search": {
+        "title": "Search for a Stop",
         "data": {
-          "line_id": "Line number",
-          "stop_ids": "Stop(s) to monitor"
+          "stop_search": "Stop name search"
+        }
+      },
+      "pick_stop": {
+        "title": "Select a Stop",
+        "data": {
+          "stop_name": "Stop name"
         }
       }
     }

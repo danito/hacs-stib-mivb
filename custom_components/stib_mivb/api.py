@@ -11,8 +11,8 @@ import aiohttp
 from .const import (
     API_KEY_HEADER,
     API_STOP_DETAILS,
-    API_STOPS_BY_LINE,
     API_WAITING_TIMES,
+    LANGUAGE_FRENCH,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -35,6 +35,7 @@ class StibMivbApiClient:
         """Initialise the client."""
         self._session = session
         self._headers = {API_KEY_HEADER: api_key}
+        # Full stop catalogue: { stop_id: {name_fr, name_nl, latitude, longitude} }
         self._stop_cache: dict[str, dict] = {}
 
     async def _get(self, url: str, params: dict | None = None) -> dict:
@@ -44,7 +45,7 @@ class StibMivbApiClient:
                 url,
                 params=params,
                 headers=self._headers,
-                timeout=aiohttp.ClientTimeout(total=10),
+                timeout=aiohttp.ClientTimeout(total=15),
             ) as resp:
                 resp.raise_for_status()
                 return await resp.json(content_type=None)
@@ -52,77 +53,18 @@ class StibMivbApiClient:
             _LOGGER.error("Error fetching %s: %s", url, err)
             raise
 
-    async def get_stops_for_line(self, line_id: str) -> list[dict]:
+    # ── Catalogue ────────────────────────────────────────────────────────────
+
+    async def load_catalogue(self) -> None:
         """
-        Return a list of stop dicts for a given line, one entry per
-        stop+direction combination. The same physical stop appears twice
-        if it is served in both City and Suburb directions.
-
-        Each dict: { id, name_fr, name_nl, latitude, longitude,
-                     direction, destination_fr, destination_nl }
-        """
-        data = await self._get(API_STOPS_BY_LINE, params={"where": f"lineid={line_id}"})
-        results = data.get("results", [])
-
-        # Collect (stop_id, direction, dest_fr, dest_nl) per occurrence.
-        # Do NOT deduplicate: same stop in two directions = two sensors.
-        raw_stops: list[tuple[str, str, str, str]] = []
-        all_stop_ids: set[str] = set()
-
-        for direction_row in results:
-            direction = direction_row.get("direction", "")
-            destination = _maybe_parse_json(direction_row.get("destination", {}))
-            dest_fr = destination.get("fr", "") if isinstance(destination, dict) else str(destination)
-            dest_nl = destination.get("nl", dest_fr) if isinstance(destination, dict) else str(destination)
-
-            points = _maybe_parse_json(direction_row.get("points", []))
-            if not isinstance(points, list):
-                continue
-
-            for point in points:
-                stop_id = str(point.get("id", ""))
-                if not stop_id:
-                    continue
-                raw_stops.append((stop_id, direction, dest_fr, dest_nl))
-                all_stop_ids.add(stop_id)
-
-        if not all_stop_ids:
-            return []
-
-        # Batch-fetch names + coordinates for all unique stop IDs in one call.
-        details_map = await self._get_stop_details_batch(all_stop_ids)
-
-        stops: list[dict] = []
-        for stop_id, direction, dest_fr, dest_nl in raw_stops:
-            details = details_map.get(stop_id, {})
-            stops.append(
-                {
-                    "id": stop_id,
-                    "name_fr": details.get("name_fr", stop_id),
-                    "name_nl": details.get("name_nl", stop_id),
-                    "latitude": details.get("latitude"),
-                    "longitude": details.get("longitude"),
-                    "direction": direction,
-                    "destination_fr": dest_fr,
-                    "destination_nl": dest_nl,
-                }
-            )
-
-        return stops
-
-    async def _get_all_stops(self) -> dict[str, dict]:
-        """
-        Fetch the complete stop catalogue (~2445 stops) in paginated chunks
-        and return a dict keyed by stop_id.
-
-        The StopDetails endpoint ignores all WHERE filters, so we download
-        the full dataset once and filter client-side.  The result is cached
-        on the instance so subsequent calls within the same session are free.
+        Download the full stop catalogue (~2445 stops) via pagination and
+        store it in self._stop_cache.  Safe to call multiple times — a
+        populated cache is never re-fetched.
         """
         if self._stop_cache:
-            return self._stop_cache
+            return
 
-        _LOGGER.debug("Fetching full stop catalogue (paginated)…")
+        _LOGGER.debug("Downloading full stop catalogue…")
         PAGE = 100
         offset = 0
         catalogue: dict[str, dict] = {}
@@ -134,7 +76,9 @@ class StibMivbApiClient:
                     params={"limit": PAGE, "offset": offset},
                 )
             except Exception as err:  # noqa: BLE001
-                _LOGGER.warning("Stop catalogue fetch failed at offset %d: %s", offset, err)
+                _LOGGER.warning(
+                    "Catalogue fetch failed at offset %d: %s", offset, err
+                )
                 break
 
             results = data.get("results", [])
@@ -158,121 +102,149 @@ class StibMivbApiClient:
                 }
 
             offset += len(results)
-            _LOGGER.debug(
-                "Stop catalogue: fetched %d/%d so far", offset, total
-            )
+            _LOGGER.debug("Catalogue: %d/%d stops loaded", offset, total)
 
             if not results or offset >= total:
                 break
 
-        _LOGGER.debug("Stop catalogue complete – %d stops loaded", len(catalogue))
+        _LOGGER.debug("Catalogue complete – %d stops loaded", len(catalogue))
         self._stop_cache = catalogue
-        return catalogue
 
-    async def _get_stop_details_batch(self, stop_ids: set[str]) -> dict[str, dict]:
+    def search_stops(self, query: str, language: str = LANGUAGE_FRENCH) -> dict[str, dict]:
         """
-        Return name + coordinates for the requested stop IDs.
-        Pulls from the full catalogue cache (fetched once per session).
+        Search the cached catalogue for stops whose name contains `query`
+        (case-insensitive).  Groups results by display name so that stops
+        sharing a name (different physical platforms) are merged.
+
+        Returns:
+          {
+            "FOREST NATIONAL": {
+              "name_fr": "FOREST NATIONAL",
+              "name_nl": "VORST NATIONAAL",
+              "point_ids": ["2616B", "2732", "2953"],
+              "latitude": 50.809...,   # from first matched point
+              "longitude": 4.323...,
+            },
+            ...
+          }
         """
-        catalogue = await self._get_all_stops()
-        result = {sid: catalogue[sid] for sid in stop_ids if sid in catalogue}
-        missing = stop_ids - result.keys()
-        if missing:
-            _LOGGER.debug("Stop IDs not found in catalogue: %s", missing)
-        return result
+        query_lower = query.strip().lower()
+        grouped: dict[str, dict] = {}
+
+        for sid, details in self._stop_cache.items():
+            name_fr = details.get("name_fr", "")
+            name_nl = details.get("name_nl", "")
+
+            # Search in both languages
+            if query_lower not in name_fr.lower() and query_lower not in name_nl.lower():
+                continue
+
+            # Group key is the display name in the chosen language
+            group_key = name_fr if language == LANGUAGE_FRENCH else name_nl
+
+            if group_key not in grouped:
+                grouped[group_key] = {
+                    "name_fr": name_fr,
+                    "name_nl": name_nl,
+                    "point_ids": [],
+                    "latitude": details.get("latitude"),
+                    "longitude": details.get("longitude"),
+                }
+            grouped[group_key]["point_ids"].append(sid)
+
+        return dict(sorted(grouped.items()))
+
+    # ── Waiting times ────────────────────────────────────────────────────────
+
+    async def get_waiting_times_for_group(
+        self, point_ids: list[str]
+    ) -> list[dict]:
+        """
+        Fetch waiting times for all physical point IDs of a stop group and
+        merge them into a deduplicated list of passages, one per line+direction.
+
+        Returns a list of:
+          {
+            "line_id": str,
+            "direction": str,
+            "destination_fr": str,
+            "destination_nl": str,
+            "minutes": int | None,
+            "next_passage": str | None,
+            "point_id": str,   # which physical ID answered first
+          }
+        """
+        import asyncio
+
+        async def _fetch(pid: str) -> list[dict]:
+            try:
+                data = await self._get(
+                    API_WAITING_TIMES, params={"where": f"pointid={pid}"}
+                )
+                return data.get("results", [])
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.warning("Waiting times fetch failed for %s: %s", pid, err)
+                return []
+
+        all_results = await asyncio.gather(*(_fetch(pid) for pid in point_ids))
+
+        # Merge: key = (line_id, destination_fr) → keep earliest arrival
+        merged: dict[tuple, dict] = {}
+
+        for pid, results in zip(point_ids, all_results):
+            for row in results:
+                line_id = str(row.get("lineid", ""))
+                passing_times = _maybe_parse_json(row.get("passingtimes", []))
+                if not isinstance(passing_times, list) or not passing_times:
+                    continue
+
+                first = passing_times[0]
+                destination = first.get("destination", {})
+                dest_fr = destination.get("fr", "") if isinstance(destination, dict) else str(destination)
+                dest_nl = destination.get("nl", dest_fr) if isinstance(destination, dict) else str(destination)
+                expected = first.get("expectedArrivalTime")
+                minutes = self._minutes_until(expected)
+                next_passage = passing_times[1].get("expectedArrivalTime") if len(passing_times) > 1 else None
+
+                key = (line_id, dest_fr)
+                existing = merged.get(key)
+                if existing is None or (minutes is not None and (existing["minutes"] is None or minutes < existing["minutes"])):
+                    merged[key] = {
+                        "line_id": line_id,
+                        "destination_fr": dest_fr,
+                        "destination_nl": dest_nl,
+                        "minutes": minutes,
+                        "next_passage": next_passage,
+                        "point_id": pid,
+                    }
+
+        return list(merged.values())
+
+    # ── Single stop detail (used for API key validation) ─────────────────────
 
     async def get_stop_details(self, stop_id: str) -> dict:
-        """Return name (fr/nl) and GPS coordinates for a single stop."""
+        """Return details for a single stop — used to validate the API key."""
         try:
             data = await self._get(API_STOP_DETAILS, params={"where": f"id={stop_id}"})
             results = data.get("results", [])
             if not results:
                 return {}
-
             row = results[0]
             name = _maybe_parse_json(row.get("name", {}))
             coords = _maybe_parse_json(row.get("gpscoordinates", {}))
-
             name_fr = name.get("fr", stop_id) if isinstance(name, dict) else str(name)
             name_nl = name.get("nl", name_fr) if isinstance(name, dict) else str(name)
-            lat = coords.get("latitude") if isinstance(coords, dict) else None
-            lon = coords.get("longitude") if isinstance(coords, dict) else None
-
             return {
                 "name_fr": name_fr,
                 "name_nl": name_nl,
-                "latitude": lat,
-                "longitude": lon,
+                "latitude": coords.get("latitude") if isinstance(coords, dict) else None,
+                "longitude": coords.get("longitude") if isinstance(coords, dict) else None,
             }
         except Exception as err:  # noqa: BLE001
             _LOGGER.warning("Could not fetch details for stop %s: %s", stop_id, err)
             return {}
 
-    async def get_waiting_times(self, stop_id: str, line_id: str) -> dict:
-        """
-        Return waiting time info for a specific stop+line combination.
-
-        Returns:
-          {
-            "minutes": int | None,
-            "next_passage": str | None,  # ISO timestamp of second upcoming vehicle
-            "destination_fr": str,
-            "destination_nl": str,
-          }
-        """
-        try:
-            data = await self._get(
-                API_WAITING_TIMES, params={"where": f"pointid={stop_id}"}
-            )
-            results = data.get("results", [])
-
-            for row in results:
-                if str(row.get("lineid", "")) != str(line_id):
-                    continue
-
-                passing_times = _maybe_parse_json(row.get("passingtimes", []))
-                if not isinstance(passing_times, list) or not passing_times:
-                    return self._empty_waiting()
-
-                first = passing_times[0]
-                expected = first.get("expectedArrivalTime")
-                destination = first.get("destination", {})
-
-                dest_fr = destination.get("fr", "") if isinstance(destination, dict) else str(destination)
-                dest_nl = destination.get("nl", dest_fr) if isinstance(destination, dict) else str(destination)
-
-                minutes = self._minutes_until(expected)
-
-                next_passage = None
-                if len(passing_times) > 1:
-                    next_passage = passing_times[1].get("expectedArrivalTime")
-
-                return {
-                    "minutes": minutes,
-                    "next_passage": next_passage,
-                    "destination_fr": dest_fr,
-                    "destination_nl": dest_nl,
-                }
-
-            return self._empty_waiting()
-
-        except Exception as err:  # noqa: BLE001
-            _LOGGER.warning(
-                "Could not fetch waiting times for stop %s line %s: %s",
-                stop_id,
-                line_id,
-                err,
-            )
-            return self._empty_waiting()
-
-    @staticmethod
-    def _empty_waiting() -> dict:
-        return {
-            "minutes": None,
-            "next_passage": None,
-            "destination_fr": "",
-            "destination_nl": "",
-        }
+    # ── Helpers ───────────────────────────────────────────────────────────────
 
     @staticmethod
     def _minutes_until(iso_timestamp: str | None) -> int | None:
