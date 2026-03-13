@@ -44,12 +44,15 @@ async def async_setup_entry(
     entities: list[StibMivbSensor] = []
 
     for group in groups:
-        # Create one sensor per passage (line+destination) found in the first
-        # coordinator data fetch.  New lines discovered on refresh are added
-        # dynamically via coordinator callbacks.
-        passages = coordinator.data.get(group["name_fr"], [])
-        for passage in passages:
-            entities.append(StibMivbSensor(coordinator, group, passage, language))
+        # Use the static skeleton (all lines from stopsByLine) so that sensors
+        # are created for every line serving this stop, even when no vehicle is
+        # currently en route.  Real-time data is merged in by the coordinator.
+        skeletons = coordinator.static_lines.get(group["name_fr"], [])
+        if not skeletons:
+            # Fallback: use whatever the first coordinator fetch returned
+            skeletons = coordinator.data.get(group["name_fr"], [])
+        for skeleton in skeletons:
+            entities.append(StibMivbSensor(coordinator, group, skeleton, language))
 
     async_add_entities(entities, update_before_add=False)
 

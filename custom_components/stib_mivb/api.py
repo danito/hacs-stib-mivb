@@ -29,6 +29,17 @@ def _maybe_parse_json(value: Any) -> Any:
     return value
 
 
+def _normalize_point_id(pid: str) -> str:
+    """
+    Strip trailing letter suffix from a point ID.
+
+    The stop catalogue and stopsByLine use suffixed IDs (e.g. "5153F", "2934A")
+    while the real-time WaitingTimes API returns bare numeric IDs ("5153", "2934").
+    Normalising to the bare form allows cross-referencing between the two.
+    """
+    return pid.rstrip("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz")
+
+
 class StibMivbApiClient:
     """API client for STIB/MIVB open data."""
 
@@ -180,14 +191,22 @@ class StibMivbApiClient:
         import asyncio
 
         async def _fetch(pid: str) -> list[dict]:
-            try:
-                data = await self._get(
-                    API_WAITING_TIMES, params={"where": f"pointid={pid}"}
-                )
-                return data.get("results", [])
-            except Exception as err:  # noqa: BLE001
-                _LOGGER.warning("Waiting times fetch failed for %s: %s", pid, err)
-                return []
+            # The rt API uses bare numeric IDs (e.g. "5153") while the catalogue
+            # stores suffixed IDs (e.g. "5153F").  Try the bare form when the
+            # suffixed form is different, and return whichever has results.
+            bare_pid = _normalize_point_id(pid)
+            ids_to_try = [pid] if bare_pid == pid else [pid, bare_pid]
+            for query_id in ids_to_try:
+                try:
+                    data = await self._get(
+                        API_WAITING_TIMES, params={"where": f"pointid={query_id}"}
+                    )
+                    results = data.get("results", [])
+                    if results:
+                        return results
+                except Exception as err:  # noqa: BLE001
+                    _LOGGER.warning("Waiting times fetch failed for %s: %s", query_id, err)
+            return []
 
         all_results = await asyncio.gather(*(_fetch(pid) for pid in point_ids))
 
@@ -227,6 +246,113 @@ class StibMivbApiClient:
                     }
 
         return list(merged.values())
+
+    # ── Lines serving a set of point IDs ────────────────────────────────────
+
+    async def get_lines_for_points(self, point_ids: list[str]) -> dict[str, list[dict]]:
+        """
+        Discover all lines that serve any of the given point IDs by scanning
+        the full stopsByLine dataset.
+
+        The stopsByLine endpoint does not support filtering by point ID, so we
+        fetch ALL lines (paginated) once and build a local index.  Results are
+        cached on the client instance.
+
+        Returns:
+          {
+            "54": [
+              {"dest_fr": "FOREST (BERVOETS)", "dest_nl": "VORST (BERVOETS)", "direction": "Suburb"},
+              {"dest_fr": "TRONE",              "dest_nl": "TROON",            "direction": "City"},
+            ],
+            "82": [...],
+            ...
+          }
+          — containing only lines whose route includes at least one of point_ids.
+        """
+        import asyncio
+
+        # Build the full point→lines index if not already done
+        if not hasattr(self, "_point_to_lines"):
+            self._point_to_lines: dict[str, list[dict]] = {}
+            await self._build_point_to_lines_index()
+
+        result: dict[str, list[dict]] = {}
+        for pid in point_ids:
+            for entry in self._point_to_lines.get(pid, []):
+                line_id = entry["line_id"]
+                if line_id not in result:
+                    result[line_id] = []
+                # Avoid duplicates
+                direction_entry = {
+                    "dest_fr": entry["dest_fr"],
+                    "dest_nl": entry["dest_nl"],
+                    "direction": entry["direction"],
+                }
+                if direction_entry not in result[line_id]:
+                    result[line_id].append(direction_entry)
+
+        return result
+
+    async def _build_point_to_lines_index(self) -> None:
+        """
+        Download all entries from stopsByLine (paginated) and build
+        self._point_to_lines: { point_id: [{line_id, dest_fr, dest_nl, direction}] }
+        """
+        _LOGGER.debug("Building point→lines index from stopsByLine…")
+        PAGE = 100
+        offset = 0
+        index: dict[str, list[dict]] = {}
+
+        while True:
+            try:
+                data = await self._get(
+                    API_STOPS_BY_LINE,
+                    params={"limit": PAGE, "offset": offset},
+                )
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.warning("stopsByLine fetch failed at offset %d: %s", offset, err)
+                break
+
+            results = data.get("results", [])
+            total = data.get("total_count", 0)
+
+            for row in results:
+                line_id = str(row.get("lineid", ""))
+                direction = row.get("direction", "")
+                destination = _maybe_parse_json(row.get("destination", {}))
+                dest_fr = destination.get("fr", "") if isinstance(destination, dict) else str(destination)
+                dest_nl = destination.get("nl", dest_fr) if isinstance(destination, dict) else str(destination)
+                points = _maybe_parse_json(row.get("points", []))
+                if not isinstance(points, list):
+                    continue
+
+                for pt in points:
+                    pid = str(pt.get("id", "")) if isinstance(pt, dict) else str(pt)
+                    if not pid:
+                        continue
+                    entry = {
+                        "line_id": line_id,
+                        "dest_fr": dest_fr,
+                        "dest_nl": dest_nl,
+                        "direction": direction,
+                    }
+                    # Index under the original ID (e.g. "5153F") AND the bare
+                    # numeric form ("5153") so that lookups work regardless of
+                    # which variant the caller has.
+                    for key in {pid, _normalize_point_id(pid)}:
+                        if key not in index:
+                            index[key] = []
+                        if entry not in index[key]:
+                            index[key].append(entry)
+
+            offset += len(results)
+            _LOGGER.debug("stopsByLine index: %d/%d rows processed", offset, total)
+
+            if not results or offset >= total:
+                break
+
+        _LOGGER.debug("Point→lines index built: %d point IDs indexed", len(index))
+        self._point_to_lines = index
 
     # ── Canonical line destinations ──────────────────────────────────────────
 
