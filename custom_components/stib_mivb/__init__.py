@@ -182,19 +182,22 @@ class StibMivbCoordinator(DataUpdateCoordinator):
                 continue
 
             # Merge real-time data into the skeleton.
-            # Match rt passage to static entry by line_id; within that line,
-            # try exact dest match first, then fall back to same direction.
+            # The rt passage carries a direction resolved from the stopsByLine
+            # index in api.py, so we can match precisely on (line_id, direction).
+            # This correctly handles lines with two directions (e.g. City/Suburb)
+            # and short-turns: a NEERSTALLE rt result for line 50 Suburb matches
+            # the GARE DU MIDI skeleton entry because both share direction=Suburb.
             for p in rt_passages:
                 line_id = p["line_id"]
+                direction = p.get("direction", "")
                 rt_dest_fr = p.get("rt_dest_fr", "")
 
-                # Find the best matching static entry for this line
-                # 1) Exact canonical dest match
+                # 1) Exact match on (line_id, direction)
                 matched_key = next(
-                    (k for k in skeleton if k[0] == line_id and k[1] == rt_dest_fr),
+                    (k for k in skeleton if k[0] == line_id and skeleton[k].get("direction") == direction),
                     None,
                 )
-                # 2) Any entry for this line (short-turn case)
+                # 2) Fallback: any entry for this line (e.g. direction unknown)
                 if matched_key is None:
                     matched_key = next(
                         (k for k in skeleton if k[0] == line_id),
@@ -213,14 +216,14 @@ class StibMivbCoordinator(DataUpdateCoordinator):
                     # Line not in static skeleton (shouldn't normally happen);
                     # add it anyway with rt destination as canonical fallback.
                     _LOGGER.debug(
-                        "Line %s at %s not in static skeleton, adding from rt",
-                        line_id, name_fr,
+                        "Line %s direction=%s at %s not in static skeleton, adding from rt",
+                        line_id, direction, name_fr,
                     )
                     skeleton[(line_id, rt_dest_fr)] = {
                         "line_id": line_id,
                         "dest_fr": rt_dest_fr,
                         "dest_nl": p.get("rt_dest_nl", ""),
-                        "direction": "",
+                        "direction": direction,
                         "rt_dest_fr": rt_dest_fr,
                         "rt_dest_nl": p.get("rt_dest_nl"),
                         "minutes": p.get("minutes"),
