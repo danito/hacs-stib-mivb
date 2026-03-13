@@ -210,13 +210,22 @@ class StibMivbApiClient:
 
         all_results = await asyncio.gather(*(_fetch(pid) for pid in point_ids))
 
-        # Merge: key = line_id → keep earliest arrival per line.
-        # We key only on line_id here because the canonical destination is
-        # resolved later by the coordinator via get_line_destinations().
-        # The rt destination is stored as rt_dest_fr/nl for fallback only.
-        merged: dict[str, dict] = {}
+        # Merge: key = (line_id, direction) — one entry per line per direction.
+        # Direction is resolved from the stopsByLine index using the point_id
+        # that responded (which tells us which branch of the route we're on).
+        # This is critical: a line with City and Suburb directions must produce
+        # two separate rt entries, otherwise one skeleton entry stays at None.
+        #
+        # The rt destination may be a short-turn; it is stored as rt_dest_fr/nl.
+        # The coordinator resolves it to the canonical destination later.
+        merged: dict[tuple, dict] = {}
 
         for pid, results in zip(point_ids, all_results):
+            # Determine the direction(s) this point_id is associated with,
+            # per line, from the static index.  Use bare pid as fallback.
+            pid_index = getattr(self, "_point_to_lines", {})
+            bare_pid = _normalize_point_id(pid)
+
             for row in results:
                 line_id = str(row.get("lineid", ""))
                 passing_times = _maybe_parse_json(row.get("passingtimes", []))
@@ -231,13 +240,25 @@ class StibMivbApiClient:
                 minutes = self._minutes_until(expected)
                 next_passage = passing_times[1].get("expectedArrivalTime") if len(passing_times) > 1 else None
 
-                existing = merged.get(line_id)
+                # Look up direction from the index for this (pid, line_id) pair
+                direction = ""
+                for lookup_pid in (pid, bare_pid):
+                    for entry in pid_index.get(lookup_pid, []):
+                        if entry["line_id"] == line_id:
+                            direction = entry["direction"]
+                            break
+                    if direction:
+                        break
+
+                key = (line_id, direction)
+                existing = merged.get(key)
                 if existing is None or (
                     minutes is not None
                     and (existing["minutes"] is None or minutes < existing["minutes"])
                 ):
-                    merged[line_id] = {
+                    merged[key] = {
                         "line_id": line_id,
+                        "direction": direction,
                         "rt_dest_fr": dest_fr,   # real-time (may be short-turn)
                         "rt_dest_nl": dest_nl,
                         "minutes": minutes,
