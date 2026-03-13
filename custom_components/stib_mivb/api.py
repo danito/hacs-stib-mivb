@@ -11,6 +11,7 @@ import aiohttp
 from .const import (
     API_KEY_HEADER,
     API_STOP_DETAILS,
+    API_STOPS_BY_LINE,
     API_WAITING_TIMES,
     LANGUAGE_FRENCH,
 )
@@ -37,6 +38,8 @@ class StibMivbApiClient:
         self._headers = {API_KEY_HEADER: api_key}
         # Full stop catalogue: { stop_id: {name_fr, name_nl, latitude, longitude} }
         self._stop_cache: dict[str, dict] = {}
+        # Canonical destinations: { line_id: [{direction, dest_fr, dest_nl}] }
+        self._line_dest_cache: dict[str, list[dict]] = {}
 
     async def _get(self, url: str, params: dict | None = None) -> dict:
         """Make a GET request and return the JSON response."""
@@ -188,8 +191,11 @@ class StibMivbApiClient:
 
         all_results = await asyncio.gather(*(_fetch(pid) for pid in point_ids))
 
-        # Merge: key = (line_id, destination_fr) → keep earliest arrival
-        merged: dict[tuple, dict] = {}
+        # Merge: key = line_id → keep earliest arrival per line.
+        # We key only on line_id here because the canonical destination is
+        # resolved later by the coordinator via get_line_destinations().
+        # The rt destination is stored as rt_dest_fr/nl for fallback only.
+        merged: dict[str, dict] = {}
 
         for pid, results in zip(point_ids, all_results):
             for row in results:
@@ -206,19 +212,64 @@ class StibMivbApiClient:
                 minutes = self._minutes_until(expected)
                 next_passage = passing_times[1].get("expectedArrivalTime") if len(passing_times) > 1 else None
 
-                key = (line_id, dest_fr)
-                existing = merged.get(key)
-                if existing is None or (minutes is not None and (existing["minutes"] is None or minutes < existing["minutes"])):
-                    merged[key] = {
+                existing = merged.get(line_id)
+                if existing is None or (
+                    minutes is not None
+                    and (existing["minutes"] is None or minutes < existing["minutes"])
+                ):
+                    merged[line_id] = {
                         "line_id": line_id,
-                        "destination_fr": dest_fr,
-                        "destination_nl": dest_nl,
+                        "rt_dest_fr": dest_fr,   # real-time (may be short-turn)
+                        "rt_dest_nl": dest_nl,
                         "minutes": minutes,
                         "next_passage": next_passage,
                         "point_id": pid,
                     }
 
         return list(merged.values())
+
+    # ── Canonical line destinations ──────────────────────────────────────────
+
+    async def get_line_destinations(self, line_id: str) -> list[dict]:
+        """
+        Return the canonical destinations for a line from stopsByLine.
+
+        Uses a per-instance cache so repeated calls for the same line are free.
+
+        Returns a list of:
+          { "direction": str, "dest_fr": str, "dest_nl": str }
+        """
+        if line_id in self._line_dest_cache:
+            return self._line_dest_cache[line_id]
+
+        try:
+            data = await self._get(
+                API_STOPS_BY_LINE, params={"where": f"lineid={line_id}"}
+            )
+            results = data.get("results", [])
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning("Could not fetch destinations for line %s: %s", line_id, err)
+            return []
+
+        destinations: list[dict] = []
+        for row in results:
+            direction = row.get("direction", "")
+            destination = _maybe_parse_json(row.get("destination", {}))
+            dest_fr = destination.get("fr", "") if isinstance(destination, dict) else str(destination)
+            dest_nl = destination.get("nl", dest_fr) if isinstance(destination, dict) else str(destination)
+            destinations.append({
+                "direction": direction,
+                "dest_fr": dest_fr,
+                "dest_nl": dest_nl,
+            })
+
+        self._line_dest_cache[line_id] = destinations
+        _LOGGER.debug(
+            "Canonical destinations for line %s: %s",
+            line_id,
+            [(d["direction"], d["dest_fr"]) for d in destinations],
+        )
+        return destinations
 
     # ── Single stop detail (used for API key validation) ─────────────────────
 

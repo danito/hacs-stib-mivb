@@ -88,15 +88,19 @@ class StibMivbCoordinator(DataUpdateCoordinator):
 
     async def _async_update_data(self) -> dict:
         """
-        Fetch waiting times for every configured stop group.
+        Fetch waiting times for every configured stop group and resolve each
+        passage's destination to the canonical end-of-line destination from
+        stopsByLine (to avoid short-turn destinations changing sensor IDs).
 
         Returns:
           {
             stop_group_name_fr: [
               {
                 "line_id": str,
-                "destination_fr": str,
-                "destination_nl": str,
+                "dest_fr": str,       # canonical destination (French)
+                "dest_nl": str,       # canonical destination (Dutch)
+                "rt_dest_fr": str,    # real-time destination (may differ)
+                "rt_dest_nl": str,
                 "minutes": int | None,
                 "next_passage": str | None,
                 "point_id": str,
@@ -114,7 +118,28 @@ class StibMivbCoordinator(DataUpdateCoordinator):
             point_ids = group.get("point_ids", [])
             try:
                 passages = await self.client.get_waiting_times_for_group(point_ids)
-                data[name_fr] = passages
+
+                # Resolve canonical destination for each passage
+                enriched = []
+                for p in passages:
+                    line_id = p["line_id"]
+                    canonical = await self.client.get_line_destinations(line_id)
+
+                    # Match the real-time destination against canonical ones.
+                    # Prefer an exact match on dest_fr; fall back to first entry.
+                    rt_dest_fr = p.get("rt_dest_fr", "")
+                    matched = next(
+                        (c for c in canonical if c["dest_fr"] == rt_dest_fr),
+                        canonical[0] if canonical else None,
+                    )
+
+                    enriched.append({
+                        **p,
+                        "dest_fr": matched["dest_fr"] if matched else rt_dest_fr,
+                        "dest_nl": matched["dest_nl"] if matched else p.get("rt_dest_nl", ""),
+                    })
+
+                data[name_fr] = enriched
             except Exception as err:  # noqa: BLE001
                 _LOGGER.warning("Failed to update stop group %s: %s", name_fr, err)
                 data[name_fr] = []

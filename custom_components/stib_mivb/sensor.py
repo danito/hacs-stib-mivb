@@ -85,22 +85,37 @@ class StibMivbSensor(CoordinatorEntity[StibMivbCoordinator], SensorEntity):
         self._longitude = group.get("longitude")
 
         self._line_id: str = passage["line_id"]
-        self._destination_fr: str = passage["destination_fr"]
-        self._destination_nl: str = passage["destination_nl"]
+        # Use canonical destinations for stable IDs; rt_dest for fallback display
+        self._dest_fr: str = passage.get("dest_fr") or passage.get("rt_dest_fr", "")
+        self._dest_nl: str = passage.get("dest_nl") or passage.get("rt_dest_nl", "")
 
         # Display name: use preferred language
         stop_display = self._name_fr if language == LANGUAGE_FRENCH else self._name_nl
-        dest_display = self._destination_fr if language == LANGUAGE_FRENCH else self._destination_nl
+        dest_display = self._dest_fr if language == LANGUAGE_FRENCH else self._dest_nl
 
-        # Unique ID: stable across restarts
-        # Use first point_id + line + destination_fr slug
-        dest_slug = self._destination_fr.lower().replace(" ", "_").replace("(", "").replace(")", "")
+        def _slug(text: str) -> str:
+            """Convert a name to a safe lowercase slug."""
+            return (
+                text.lower()
+                .replace(" ", "_")
+                .replace("(", "")
+                .replace(")", "")
+                .replace("-", "_")
+                .replace("/", "_")
+                .replace("'", "")
+            )
+
+        stop_slug = _slug(self._name_fr)
+        dest_slug = _slug(self._dest_fr)
+
+        # Unique ID: domain + first_point_id + line + stop_slug + dest_slug
+        # Includes stop name so two stops on the same line don't collide.
         self._attr_unique_id = (
-            f"{DOMAIN}_{self._point_ids[0]}_{self._line_id}_{dest_slug}"
+            f"{DOMAIN}_{self._point_ids[0]}_{self._line_id}_{stop_slug}_{dest_slug}"
         )
 
-        # Sensor name: "Line 54 → FOREST (BERVOETS)"  under device "FOREST NATIONAL"
-        self._attr_name = f"Line {self._line_id} → {dest_display}"
+        # Sensor name: "Line 54 – FOREST NATIONAL → FOREST (BERVOETS)"
+        self._attr_name = f"Line {self._line_id} – {stop_display} → {dest_display}"
 
         # Device: one per stop group name
         self._attr_device_info = DeviceInfo(
@@ -115,7 +130,10 @@ class StibMivbSensor(CoordinatorEntity[StibMivbCoordinator], SensorEntity):
         """Find this sensor's passage in the latest coordinator data."""
         passages = self.coordinator.data.get(self._name_fr, [])
         for p in passages:
-            if p["line_id"] == self._line_id and p["destination_fr"] == self._destination_fr:
+            if p["line_id"] == self._line_id and (
+                p.get("dest_fr") == self._dest_fr
+                or p.get("rt_dest_fr") == self._dest_fr
+            ):
                 return p
         return {}
 
@@ -129,8 +147,8 @@ class StibMivbSensor(CoordinatorEntity[StibMivbCoordinator], SensorEntity):
         """Return rich attributes."""
         p = self._current_passage
         dest = (
-            self._destination_fr if self._language == LANGUAGE_FRENCH
-            else self._destination_nl
+            self._dest_fr if self._language == LANGUAGE_FRENCH
+            else self._dest_nl
         )
         return {
             ATTR_NEXT_PASSAGE: p.get("next_passage"),
