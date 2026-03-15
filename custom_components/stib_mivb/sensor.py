@@ -153,8 +153,12 @@ class StibMivbSensor(CoordinatorEntity[StibMivbCoordinator], SensorEntity):
             self._dest_fr if self._language == LANGUAGE_FRENCH
             else self._dest_nl
         )
+        next_passage_ts = p.get("next_passage")
+        next_passage_minutes = self.coordinator.client._minutes_until(next_passage_ts)
+
         return {
-            ATTR_NEXT_PASSAGE: p.get("next_passage"),
+            ATTR_NEXT_PASSAGE: next_passage_ts,
+            "next_passage_minutes": next_passage_minutes,
             ATTR_LATITUDE: self._latitude,
             ATTR_LONGITUDE: self._longitude,
             ATTR_STOP_NAME_FR: self._name_fr,
