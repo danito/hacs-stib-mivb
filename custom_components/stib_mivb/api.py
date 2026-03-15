@@ -174,60 +174,74 @@ class StibMivbApiClient:
         self, point_ids: list[str]
     ) -> list[dict]:
         """
-        Fetch waiting times for all physical point IDs of a stop group and
-        merge them into a deduplicated list of passages, one per line+direction.
+        Fetch waiting times for a stop group using one request per line (not
+        one request per point ID), then filter results client-side.
+
+        This drastically reduces API calls: a stop served by 3 lines makes 3
+        requests instead of up to 8 (4 point IDs × try-bare fallback).
+
+        Strategy:
+          1. Determine which lines serve this stop group from the static index.
+          2. For each line, fetch WaitingTimes?where=lineid=X (one request).
+          3. Filter returned rows to only those whose pointid matches one of our
+             point IDs (bare-normalised comparison).
+          4. Merge into one entry per (line_id, direction).
 
         Returns a list of:
           {
             "line_id": str,
             "direction": str,
-            "destination_fr": str,
-            "destination_nl": str,
+            "rt_dest_fr": str,
+            "rt_dest_nl": str,
             "minutes": int | None,
+            "current_passage": str | None,
             "next_passage": str | None,
-            "point_id": str,   # which physical ID answered first
+            "point_id": str,
           }
         """
         import asyncio
 
-        async def _fetch(pid: str) -> list[dict]:
-            # The rt API uses bare numeric IDs (e.g. "5153") while the catalogue
-            # stores suffixed IDs (e.g. "5153F").  Try the bare form when the
-            # suffixed form is different, and return whichever has results.
-            bare_pid = _normalize_point_id(pid)
-            ids_to_try = [pid] if bare_pid == pid else [pid, bare_pid]
-            for query_id in ids_to_try:
-                try:
-                    data = await self._get(
-                        API_WAITING_TIMES, params={"where": f"pointid={query_id}"}
-                    )
-                    results = data.get("results", [])
-                    if results:
-                        return results
-                except Exception as err:  # noqa: BLE001
-                    _LOGGER.warning("Waiting times fetch failed for %s: %s", query_id, err)
+        # Build a set of bare (suffix-stripped) point IDs for fast membership test
+        bare_point_ids: set[str] = {_normalize_point_id(p) for p in point_ids}
+        # Also accept original forms in case the API ever returns them suffixed
+        all_point_id_forms: set[str] = bare_point_ids | set(point_ids)
+
+        # Find lines serving this stop from the static index
+        pid_index = getattr(self, "_point_to_lines", {})
+        line_ids: set[str] = set()
+        for pid in point_ids:
+            for entry in pid_index.get(pid, []):
+                line_ids.add(entry["line_id"])
+            for entry in pid_index.get(_normalize_point_id(pid), []):
+                line_ids.add(entry["line_id"])
+
+        if not line_ids:
+            _LOGGER.debug("No lines found in static index for point_ids %s", point_ids)
             return []
 
-        all_results = await asyncio.gather(*(_fetch(pid) for pid in point_ids))
+        async def _fetch_line(line_id: str) -> list[dict]:
+            try:
+                data = await self._get(
+                    API_WAITING_TIMES, params={"where": f"lineid={line_id}"}
+                )
+                return data.get("results", [])
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.warning("Waiting times fetch failed for line %s: %s", line_id, err)
+                return []
 
-        # Merge: key = (line_id, direction) — one entry per line per direction.
-        # Direction is resolved from the stopsByLine index using the point_id
-        # that responded (which tells us which branch of the route we're on).
-        # This is critical: a line with City and Suburb directions must produce
-        # two separate rt entries, otherwise one skeleton entry stays at None.
-        #
-        # The rt destination may be a short-turn; it is stored as rt_dest_fr/nl.
-        # The coordinator resolves it to the canonical destination later.
+        all_results = await asyncio.gather(*(_fetch_line(lid) for lid in line_ids))
+
+        # Merge: key = (line_id, direction) — one entry per line per direction,
+        # keeping the earliest arrival among all matching point IDs.
         merged: dict[tuple, dict] = {}
 
-        for pid, results in zip(point_ids, all_results):
-            # Determine the direction(s) this point_id is associated with,
-            # per line, from the static index.  Use bare pid as fallback.
-            pid_index = getattr(self, "_point_to_lines", {})
-            bare_pid = _normalize_point_id(pid)
-
+        for line_id, results in zip(line_ids, all_results):
             for row in results:
-                line_id = str(row.get("lineid", ""))
+                row_pid = str(row.get("pointid", ""))
+                # Only keep rows for point IDs that belong to our stop group
+                if row_pid not in all_point_id_forms:
+                    continue
+
                 passing_times = _maybe_parse_json(row.get("passingtimes", []))
                 if not isinstance(passing_times, list) or not passing_times:
                     continue
@@ -240,9 +254,9 @@ class StibMivbApiClient:
                 minutes = self._minutes_until(expected)
                 next_passage = passing_times[1].get("expectedArrivalTime") if len(passing_times) > 1 else None
 
-                # Look up direction from the index for this (pid, line_id) pair
+                # Resolve direction from the static index
                 direction = ""
-                for lookup_pid in (pid, bare_pid):
+                for lookup_pid in (row_pid, _normalize_point_id(row_pid)):
                     for entry in pid_index.get(lookup_pid, []):
                         if entry["line_id"] == line_id:
                             direction = entry["direction"]
@@ -259,12 +273,12 @@ class StibMivbApiClient:
                     merged[key] = {
                         "line_id": line_id,
                         "direction": direction,
-                        "rt_dest_fr": dest_fr,   # real-time (may be short-turn)
+                        "rt_dest_fr": dest_fr,
                         "rt_dest_nl": dest_nl,
                         "minutes": minutes,
-                        "current_passage": expected,   # ISO timestamp of next vehicle
-                        "next_passage": next_passage,  # ISO timestamp of vehicle after that
-                        "point_id": pid,
+                        "current_passage": expected,
+                        "next_passage": next_passage,
+                        "point_id": row_pid,
                     }
 
         return list(merged.values())
