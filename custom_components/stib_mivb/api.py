@@ -262,7 +262,8 @@ class StibMivbApiClient:
                         "rt_dest_fr": dest_fr,   # real-time (may be short-turn)
                         "rt_dest_nl": dest_nl,
                         "minutes": minutes,
-                        "next_passage": next_passage,
+                        "current_passage": expected,   # ISO timestamp of next vehicle
+                        "next_passage": next_passage,  # ISO timestamp of vehicle after that
                         "point_id": pid,
                     }
 
