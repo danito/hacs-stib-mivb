@@ -170,22 +170,58 @@ class StibMivbApiClient:
 
     # ── Waiting times ────────────────────────────────────────────────────────
 
-    async def get_waiting_times_for_group(
+    async def refresh_waiting_times_cache(self) -> None:
+        """
+        Download the full real-time WaitingTimes dataset (all lines, all stops)
+        in a single paginated fetch and store it in self._rt_cache.
+
+        This is called once per coordinator refresh cycle instead of making one
+        request per line or per point ID.  All per-stop filtering is then done
+        client-side against this cache — so the total API cost is 1 request per
+        refresh regardless of how many stops or lines are monitored.
+        """
+        PAGE = 1000  # maximise rows per request to minimise round-trips
+        offset = 0
+        cache: dict[str, list[dict]] = {}  # { bare_point_id: [row, ...] }
+
+        _LOGGER.debug("Refreshing full WaitingTimes cache…")
+
+        while True:
+            try:
+                data = await self._get(
+                    API_WAITING_TIMES,
+                    params={"limit": PAGE, "offset": offset},
+                )
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.warning("WaitingTimes bulk fetch failed at offset %d: %s", offset, err)
+                break
+
+            results = data.get("results", [])
+            total = data.get("total_count", 0)
+
+            for row in results:
+                pid = str(row.get("pointid", ""))
+                bare = _normalize_point_id(pid)
+                # Index under both the returned ID and its bare form
+                for key in {pid, bare}:
+                    cache.setdefault(key, []).append(row)
+
+            offset += len(results)
+            _LOGGER.debug("WaitingTimes cache: %d/%d rows loaded", offset, total)
+
+            if not results or offset >= total:
+                break
+
+        _LOGGER.debug("WaitingTimes cache complete — %d point IDs indexed", len(cache))
+        self._rt_cache: dict[str, list[dict]] = cache
+
+    def get_waiting_times_for_group(
         self, point_ids: list[str]
     ) -> list[dict]:
         """
-        Fetch waiting times for a stop group using one request per line (not
-        one request per point ID), then filter results client-side.
+        Filter the in-memory WaitingTimes cache for a stop group's point IDs.
 
-        This drastically reduces API calls: a stop served by 3 lines makes 3
-        requests instead of up to 8 (4 point IDs × try-bare fallback).
-
-        Strategy:
-          1. Determine which lines serve this stop group from the static index.
-          2. For each line, fetch WaitingTimes?where=lineid=X (one request).
-          3. Filter returned rows to only those whose pointid matches one of our
-             point IDs (bare-normalised comparison).
-          4. Merge into one entry per (line_id, direction).
+        Must be called after refresh_waiting_times_cache().  No network I/O.
 
         Returns a list of:
           {
@@ -199,87 +235,63 @@ class StibMivbApiClient:
             "point_id": str,
           }
         """
-        import asyncio
-
-        # Build a set of bare (suffix-stripped) point IDs for fast membership test
-        bare_point_ids: set[str] = {_normalize_point_id(p) for p in point_ids}
-        # Also accept original forms in case the API ever returns them suffixed
-        all_point_id_forms: set[str] = bare_point_ids | set(point_ids)
-
-        # Find lines serving this stop from the static index
+        rt_cache = getattr(self, "_rt_cache", {})
         pid_index = getattr(self, "_point_to_lines", {})
-        line_ids: set[str] = set()
-        for pid in point_ids:
-            for entry in pid_index.get(pid, []):
-                line_ids.add(entry["line_id"])
-            for entry in pid_index.get(_normalize_point_id(pid), []):
-                line_ids.add(entry["line_id"])
 
-        if not line_ids:
-            _LOGGER.debug("No lines found in static index for point_ids %s", point_ids)
-            return []
+        # Collect all rows from the cache that match any of our point IDs
+        all_point_id_forms: set[str] = set(point_ids) | {_normalize_point_id(p) for p in point_ids}
+        rows: list[tuple[str, dict]] = []  # (original_pid, row)
+        seen_rows: set[int] = set()
+        for pid in all_point_id_forms:
+            for row in rt_cache.get(pid, []):
+                rid = id(row)
+                if rid not in seen_rows:
+                    seen_rows.add(rid)
+                    rows.append((pid, row))
 
-        async def _fetch_line(line_id: str) -> list[dict]:
-            try:
-                data = await self._get(
-                    API_WAITING_TIMES, params={"where": f"lineid={line_id}"}
-                )
-                return data.get("results", [])
-            except Exception as err:  # noqa: BLE001
-                _LOGGER.warning("Waiting times fetch failed for line %s: %s", line_id, err)
-                return []
-
-        all_results = await asyncio.gather(*(_fetch_line(lid) for lid in line_ids))
-
-        # Merge: key = (line_id, direction) — one entry per line per direction,
-        # keeping the earliest arrival among all matching point IDs.
+        # Merge into one entry per (line_id, direction)
         merged: dict[tuple, dict] = {}
 
-        for line_id, results in zip(line_ids, all_results):
-            for row in results:
-                row_pid = str(row.get("pointid", ""))
-                # Only keep rows for point IDs that belong to our stop group
-                if row_pid not in all_point_id_forms:
-                    continue
+        for row_pid, row in rows:
+            line_id = str(row.get("lineid", ""))
+            passing_times = _maybe_parse_json(row.get("passingtimes", []))
+            if not isinstance(passing_times, list) or not passing_times:
+                continue
 
-                passing_times = _maybe_parse_json(row.get("passingtimes", []))
-                if not isinstance(passing_times, list) or not passing_times:
-                    continue
+            first = passing_times[0]
+            destination = first.get("destination", {})
+            dest_fr = destination.get("fr", "") if isinstance(destination, dict) else str(destination)
+            dest_nl = destination.get("nl", dest_fr) if isinstance(destination, dict) else str(destination)
+            expected = first.get("expectedArrivalTime")
+            minutes = self._minutes_until(expected)
+            next_passage = passing_times[1].get("expectedArrivalTime") if len(passing_times) > 1 else None
 
-                first = passing_times[0]
-                destination = first.get("destination", {})
-                dest_fr = destination.get("fr", "") if isinstance(destination, dict) else str(destination)
-                dest_nl = destination.get("nl", dest_fr) if isinstance(destination, dict) else str(destination)
-                expected = first.get("expectedArrivalTime")
-                minutes = self._minutes_until(expected)
-                next_passage = passing_times[1].get("expectedArrivalTime") if len(passing_times) > 1 else None
-
-                # Resolve direction from the static index
-                direction = ""
-                for lookup_pid in (row_pid, _normalize_point_id(row_pid)):
-                    for entry in pid_index.get(lookup_pid, []):
-                        if entry["line_id"] == line_id:
-                            direction = entry["direction"]
-                            break
-                    if direction:
+            # Resolve direction from the static index
+            direction = ""
+            for lookup_pid in (row_pid, _normalize_point_id(row_pid)):
+                for entry in pid_index.get(lookup_pid, []):
+                    if entry["line_id"] == line_id:
+                        direction = entry["direction"]
                         break
+                if direction:
+                    break
 
-                key = (line_id, direction)
-                existing = merged.get(key)
-                if existing is None or (
-                    minutes is not None
-                    and (existing["minutes"] is None or minutes < existing["minutes"])
-                ):
-                    merged[key] = {
-                        "line_id": line_id,
-                        "direction": direction,
-                        "rt_dest_fr": dest_fr,
-                        "rt_dest_nl": dest_nl,
-                        "minutes": minutes,
-                        "current_passage": expected,
-                        "next_passage": next_passage,
-                        "point_id": row_pid,
-                    }
+            key = (line_id, direction)
+            existing = merged.get(key)
+            if existing is None or (
+                minutes is not None
+                and (existing["minutes"] is None or minutes < existing["minutes"])
+            ):
+                merged[key] = {
+                    "line_id": line_id,
+                    "direction": direction,
+                    "rt_dest_fr": dest_fr,
+                    "rt_dest_nl": dest_nl,
+                    "minutes": minutes,
+                    "current_passage": expected,
+                    "next_passage": next_passage,
+                    "point_id": row_pid,
+                }
 
         return list(merged.values())
 

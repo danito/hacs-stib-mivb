@@ -164,6 +164,13 @@ class StibMivbCoordinator(DataUpdateCoordinator):
         groups = self.entry.data.get(CONF_STOP_GROUPS, [])
         data: dict = {}
 
+        # Single bulk fetch for the entire network — one API call per refresh.
+        try:
+            await self.client.refresh_waiting_times_cache()
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning("WaitingTimes bulk refresh failed: %s", err)
+            # Keep going — per-group filtering will use the previous cache
+
         for group in groups:
             name_fr = group["name_fr"]
             point_ids = group.get("point_ids", [])
@@ -175,9 +182,9 @@ class StibMivbCoordinator(DataUpdateCoordinator):
                 skeleton[key] = dict(s)  # copy so we don't mutate static_lines
 
             try:
-                rt_passages = await self.client.get_waiting_times_for_group(point_ids)
+                rt_passages = self.client.get_waiting_times_for_group(point_ids)
             except Exception as err:  # noqa: BLE001
-                _LOGGER.warning("Real-time fetch failed for %s: %s", name_fr, err)
+                _LOGGER.warning("Real-time filter failed for %s: %s", name_fr, err)
                 data[name_fr] = list(skeleton.values())
                 continue
 
